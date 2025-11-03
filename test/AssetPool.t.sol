@@ -3,6 +3,7 @@
 pragma solidity ^0.8.20;
 
 import "./utils/ProtocolTestUtils.sol";
+import "../src/interfaces/IAssetPool.sol";
 
 /**
  * @title AssetPoolTest
@@ -688,6 +689,103 @@ contract AssetPoolTest is ProtocolTestUtils {
         
         // Pool should be active again
         assertTrue(_isPoolActive(), "Pool should be active after rebalance");
+    }
+
+
+    function testTokenSplitThirdPartyClaimLeavesUserDoubleSplit() public {
+        address helper = makeAddr("helper");
+        uint256 depositAmount = adjustAmountForDecimals(MEDIUM_DEPOSIT, 6);
+        uint256 collateralAmount = (depositAmount * COLLATERAL_RATIO) / 100;
+
+        // User establishes an initial position
+        vm.startPrank(user1);
+        assetPool.depositRequest(depositAmount, collateralAmount);
+        vm.stopPrank();
+
+        completeCycleWithPriceChange(INITIAL_PRICE);
+
+        vm.prank(user1);
+        assetPool.claimAsset(user1);
+
+        uint256 baseSplitIndex = assetPool.userSplitIndex(user1);
+        assertEq(baseSplitIndex, cycleManager.poolSplitIndex(), "user split index should match pool");
+
+        // Queue another deposit that will be claimed later by the helper
+        vm.startPrank(user1);
+        assetPool.depositRequest(depositAmount, collateralAmount);
+        vm.stopPrank();
+
+        completeCycleWithPriceChange(INITIAL_PRICE);
+
+        (IAssetPool.RequestType pendingType,,,) = assetPool.userRequests(user1);
+        assertEq(uint(pendingType), uint(IAssetPool.RequestType.DEPOSIT), "deposit request should be pending");
+
+        // Begin a new cycle where a 2:1 stock split is resolved
+        uint256 splitPrice = INITIAL_PRICE / 2;
+        vm.prank(owner);
+        assetOracle.setMarketOpen(true);
+        vm.prank(owner);
+        assetOracle.setOHLCData(
+            splitPrice,
+            (splitPrice * 105) / 100,
+            (splitPrice * 95) / 100,
+            splitPrice,
+            block.timestamp
+        );
+
+        assertLe(block.timestamp - assetOracle.lastUpdated(), poolStrategy.oracleUpdateThreshold(), "oracle should be fresh");
+
+        bytes32 cycleStateSlot = bytes32(uint256(25));
+        vm.store(address(cycleManager), cycleStateSlot, bytes32(uint256(IPoolCycleManager.CycleState.POOL_REBALANCING_OFFCHAIN)));
+
+        vm.prank(owner);
+        cycleManager.resolvePriceDeviation(true, 2, 1);
+
+        vm.warp(block.timestamp + 1 hours);
+        vm.prank(owner);
+        assetOracle.setOHLCData(
+            splitPrice,
+            (splitPrice * 105) / 100,
+            (splitPrice * 95) / 100,
+            splitPrice,
+            block.timestamp
+        );
+        vm.prank(owner);
+        assetOracle.setMarketOpen(false);
+        vm.prank(owner);
+        cycleManager.initiateOnchainRebalance();
+
+        vm.prank(liquidityProvider1);
+        cycleManager.rebalancePool(liquidityProvider1, splitPrice);
+        vm.prank(liquidityProvider2);
+        cycleManager.rebalancePool(liquidityProvider2, splitPrice);
+
+        assertEq(uint(cycleManager.cycleState()), uint(IPoolCycleManager.CycleState.POOL_ACTIVE), "pool should return active");
+
+        // Helper finalises the deposit claim on behalf of the user
+        vm.prank(helper);
+        assetPool.claimAsset(user1);
+
+        // Helper's split index is updated but the actual user's remains stale
+        assertEq(assetPool.userSplitIndex(helper), cycleManager.poolSplitIndex(), "helper index should update");
+        assertEq(assetPool.userSplitIndex(user1), baseSplitIndex, "user index should remain stale");
+
+        (uint256 positionAfterHelper,,) = assetPool.userPositions(user1);
+        uint256 walletAfterHelper = assetToken.balanceOf(user1);
+        assertEq(positionAfterHelper, walletAfterHelper, "position should reflect wallet after helper claim");
+
+        // User interaction triggers another split adjustment on the already adjusted position
+        uint256 redeemAmount = walletAfterHelper / 2;
+        assertGt(redeemAmount, 0, "redeem amount should be non-zero");
+
+        vm.startPrank(user1);
+        assetToken.approve(address(assetPool), redeemAmount);
+        assetPool.redemptionRequest(redeemAmount);
+        vm.stopPrank();
+
+        (uint256 positionAfterUser,,) = assetPool.userPositions(user1);
+        assertEq(assetPool.userSplitIndex(user1), cycleManager.poolSplitIndex(), "user index should refresh");
+        assertEq(positionAfterUser, positionAfterHelper * 2, "position should have been doubled erroneously");
     }
 
 

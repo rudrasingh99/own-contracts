@@ -155,6 +155,44 @@ contract PoolCycleManagerTest is ProtocolTestUtils {
         assertGt(cycleManager.cyclePriceOpen(), 0, "Cycle open price should be set");
         assertGt(cycleManager.cyclePriceClose(), 0, "Cycle close price should be set");
     }
+
+    function testAccrueInterestIgnoresElapsedTimeBeforeLaunch() public {
+        // Ensure no assets have been minted yet
+        assertEq(assetToken.totalSupply(), 0, "Initial asset supply should be zero");
+
+        // Let significant time elapse before the first on-chain rebalance
+        vm.warp(block.timestamp + 50 * 365 days);
+
+        // Start the first off-chain rebalance after the long idle period
+        vm.prank(owner);
+        assetOracle.setMarketOpen(true);
+        updateOraclePrice(INITIAL_PRICE);
+        vm.prank(owner);
+        cycleManager.initiateOffchainRebalance();
+
+        // Advance time and transition to on-chain rebalance
+        vm.warp(block.timestamp + 1 hours);
+        vm.prank(owner);
+        assetOracle.setMarketOpen(false);
+        updateOraclePriceWithOHLC(
+            INITIAL_PRICE * 98 / 100,
+            INITIAL_PRICE * 105 / 100,
+            INITIAL_PRICE * 95 / 100,
+            INITIAL_PRICE
+        );
+
+        vm.prank(owner);
+        cycleManager.initiateOnchainRebalance();
+
+        // Interest should still be zero because no xTokens existed
+        assertEq(cycleManager.cycleInterestAmount(), 0, "Interest should remain zero without supply");
+
+        // Rebalancing should continue without reverting on interest deduction
+        vm.prank(liquidityProvider1);
+        cycleManager.rebalancePool(liquidityProvider1, INITIAL_PRICE);
+        vm.prank(liquidityProvider2);
+        cycleManager.rebalancePool(liquidityProvider2, INITIAL_PRICE);
+    }
     
     /**
      * @notice Test initiating onchain rebalance fails when not in offchain rebalance state
